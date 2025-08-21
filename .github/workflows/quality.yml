@@ -19,17 +19,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ingest (last 7 days)
+      - name: Ingest (last 7 days, safer paging/retries)
         env:
           SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
         run: |
-          python src/fetch.py --days 7 --out data/raw_311.parquet --summary notes/data_ingest_summary.md
+          python src/fetch.py \
+            --days 7 \
+            --chunk 10000 \
+            --timeout 300 \
+            --retries 5 \
+            --out data/raw_311.parquet \
+            --summary notes/data_ingest_summary.md
 
       - name: Checks (API sample 5k)
         env:
           SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
         run: |
-          python src/explore_311.py --source api --limit 5000 --out notes/data_quality_checks.md --mark-done
+          python src/explore_311.py \
+            --source api \
+            --limit 5000 \
+            --out notes/data_quality_checks.md \
+            --mark-done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
