@@ -1,0 +1,75 @@
+git # --------------------
+# Python
+# --------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# --------------------
+# Virtual environment
+# --------------------
+.venv/
+env/
+venv/
+ENV/
+
+# --------------------
+# Environment variables
+# --------------------
+.env
+*.secret
+
+# --------------------
+# Data files (don’t version raw data)
+# --------------------
+data/*.parquet
+data/*.csv
+data/*.json
+data/*.xlsx
+
+# --------------------
+# Notes and logs
+# --------------------
+notes/*.md
+*.log
+
+# --------------------
+# IDE / Editor configs
+# --------------------
+.vscode/
+.idea/
+
+# --------------------
+# OS files
+# --------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# --------------------
+# Jupyter
+# --------------------
+*.ipynb
+.ipynb_checkpoints/
+
+# --------------------
+# Testing
+# --------------------
+.coverage
+htmlcov/
+.pytest_cache/
+
+# --------------------
+# Packaging
+# --------------------
+*.tar.gz
+*.whl
+MANIFEST
