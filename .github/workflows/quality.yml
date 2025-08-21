@@ -1,0 +1,41 @@
+name: 311 Quality Nightly
+on:
+  schedule:
+    - cron: "30 2 * * *"   # 02:30 UTC nightly
+  workflow_dispatch:
+
+jobs:
+  run-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ingest (last 7 days)
+        env:
+          SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+        run: |
+          python src/fetch.py --days 7 --out data/raw_311.parquet --summary notes/data_ingest_summary.md
+
+      - name: Checks (API sample 5k)
+        env:
+          SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+        run: |
+          python src/explore_311.py --source api --limit 5000 --out notes/data_quality_checks.md --mark-done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            data/raw_311.parquet
+            notes/data_ingest_summary.md
+            notes/data_quality_checks.md
