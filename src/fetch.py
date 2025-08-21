@@ -1,4 +1,5 @@
-# src/fetch.py
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import os, argparse, sys
 from datetime import datetime, timedelta, timezone
 import pandas as pd
@@ -21,17 +22,52 @@ DATE_FIELD_CANDIDATES = [
     "date_created",
 ]
 
-def _sample_columns(headers: dict) -> set:
+
+# ---------------------------------------------------------------------
+# Robust HTTP session with retries/backoff (handles 429/5xx/timeouts)
+# ---------------------------------------------------------------------
+def _build_session(app_token: str | None, retries: int = 5) -> requests.Session:
+    """
+    Create a requests session with retry/backoff tuned for Socrata.
+    Retries on timeouts and common 5xx/429 throttling.
+    """
+    sess = requests.Session()
+    if app_token:
+        sess.headers.update({"X-App-Token": app_token})
+
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=1.5,                # 1.5s, 3s, 4.5s, ...
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+
+def _sample_columns(session: requests.Session, timeout: int = 60) -> set:
     """Fetch 1 row to learn which columns exist."""
-    r = requests.get(API_URL, params={"$limit": 1}, headers=headers, timeout=60)
+    r = session.get(API_URL, params={"$limit": 1}, timeout=timeout)
     r.raise_for_status()
     rows = r.json() or [{}]
     return set(rows[0].keys())
 
-def _try_page(where_expr: str, order_col: str, chunk: int, headers: dict) -> list[dict]:
+
+def _try_page(
+    session: requests.Session,
+    where_expr: str,
+    order_col: str,
+    chunk: int,
+    timeout: int = 120,
+) -> list[dict]:
     """Attempt a single page fetch; raise with helpful context on HTTP errors."""
     params = {"$where": where_expr, "$limit": chunk, "$offset": 0, "$order": order_col}
-    r = requests.get(API_URL, headers=headers, params=params, timeout=120)
+    r = session.get(API_URL, params=params, timeout=timeout)
     try:
         r.raise_for_status()
     except requests.HTTPError as e:
@@ -42,14 +78,21 @@ def _try_page(where_expr: str, order_col: str, chunk: int, headers: dict) -> lis
         ) from e
     return r.json()
 
-def _page_iter_no_where(order_col: str | None, chunk: int, headers: dict, start_offset: int = 0):
+
+def _page_iter_no_where(
+    session: requests.Session,
+    order_col: str | None,
+    chunk: int,
+    start_offset: int = 0,
+    timeout: int = 300,
+):
     """Yield rows across pages without a $where clause (fallback mode)."""
     offset = start_offset
     while True:
         params = {"$limit": chunk, "$offset": offset}
         if order_col:
             params["$order"] = order_col
-        r = requests.get(API_URL, headers=headers, params=params, timeout=120)
+        r = session.get(API_URL, params=params, timeout=timeout)
         r.raise_for_status()
         rows = r.json()
         if not rows:
@@ -59,7 +102,16 @@ def _page_iter_no_where(order_col: str | None, chunk: int, headers: dict, start_
         if len(rows) < chunk:
             break
 
-def fetch_api(days_back=90, chunk=50000, app_token=None, created_field: str | None = None, max_pages: int = 30):
+
+def fetch_api(
+    days_back=90,
+    chunk=10000,
+    app_token=None,
+    created_field: str | None = None,
+    max_pages: int = 30,
+    timeout: int = 300,
+    retries: int = 5,
+):
     """
     Pull recent rows from the Socrata API in pages, robust to text vs datetime columns.
     Strategy:
@@ -69,10 +121,10 @@ def fetch_api(days_back=90, chunk=50000, app_token=None, created_field: str | No
          If both fail for all candidates, fall back to:
       2) Blind pagination (no $where), order if possible, then filter locally by parsed dates.
     """
-    headers = {"X-App-Token": app_token} if app_token else {}
+    session = _build_session(app_token=app_token, retries=retries)
 
     # discover columns
-    cols = _sample_columns(headers)
+    cols = _sample_columns(session=session, timeout=60)
 
     # choose a date column list to consider
     if created_field:
@@ -98,10 +150,10 @@ def fetch_api(days_back=90, chunk=50000, app_token=None, created_field: str | No
     first_rows = None
 
     for dc in date_cols_to_try:
-        # 1) raw comparison
+        # 1) raw comparison (works if field is a true timestamp)
         try:
             where_expr = f"{dc} >= '{since_str}'"
-            first_rows = _try_page(where_expr, dc, chunk=min(5, chunk), headers=headers)
+            first_rows = _try_page(session, where_expr, dc, chunk=min(5, chunk), timeout=timeout)
             working_where, working_order = where_expr, dc
             break
         except SystemExit as e_raw:
@@ -110,7 +162,13 @@ def fetch_api(days_back=90, chunk=50000, app_token=None, created_field: str | No
             if "type-mismatch" in msg or "Type mismatch" in msg or "op$>=" in msg:
                 try:
                     cast_where = f"{dc}::floating_timestamp >= '{since_str}'"
-                    first_rows = _try_page(cast_where, f"{dc}::floating_timestamp", chunk=min(5, chunk), headers=headers)
+                    first_rows = _try_page(
+                        session,
+                        cast_where,
+                        f"{dc}::floating_timestamp",
+                        chunk=min(5, chunk),
+                        timeout=timeout,
+                    )
                     working_where, working_order = cast_where, f"{dc}::floating_timestamp"
                     break
                 except SystemExit:
@@ -131,7 +189,7 @@ def fetch_api(days_back=90, chunk=50000, app_token=None, created_field: str | No
         offset = start_offset
         while True:
             params = {"$where": working_where, "$limit": chunk, "$offset": offset, "$order": working_order}
-            r = requests.get(API_URL, headers=headers, params=params, timeout=120)
+            r = session.get(API_URL, params=params, timeout=timeout)
             r.raise_for_status()
             rows = r.json()
             if not rows:
@@ -155,7 +213,13 @@ def fetch_api(days_back=90, chunk=50000, app_token=None, created_field: str | No
     kept_frames = []
     pages_scanned = 0
 
-    for rows in _page_iter_no_where(order_col=order_col, chunk=chunk, headers=headers):
+    for rows in _page_iter_no_where(
+        session=session,
+        order_col=order_col,
+        chunk=chunk,
+        start_offset=0,
+        timeout=timeout,
+    ):
         pages_scanned += 1
         page_df = pd.DataFrame(rows)
 
@@ -197,6 +261,7 @@ def fetch_api(days_back=90, chunk=50000, app_token=None, created_field: str | No
 
     return pd.concat(kept_frames, ignore_index=True) if kept_frames else pd.DataFrame()
 
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=90, help="Days back from now (UTC) to fetch via API.")
@@ -206,6 +271,10 @@ def main():
     ap.add_argument("--path", help="CSV path if --source csv")
     ap.add_argument("--created-field", help="Override the created-date field name (e.g., requested_datetime).")
     ap.add_argument("--max-pages", type=int, default=30, help="Max pages to scan in fallback mode.")
+    # NEW tunables for CI reliability
+    ap.add_argument("--chunk", type=int, default=10000, help="API page size (default 10k).")
+    ap.add_argument("--timeout", type=int, default=300, help="Per-request timeout seconds.")
+    ap.add_argument("--retries", type=int, default=5, help="HTTP retries for API calls.")
     args = ap.parse_args()
 
     os.makedirs("data", exist_ok=True)
@@ -214,10 +283,12 @@ def main():
     if args.source == "api":
         df = fetch_api(
             days_back=args.days,
-            chunk=50000,
+            chunk=args.chunk,
             app_token=os.getenv("SOCRATA_APP_TOKEN"),
             created_field=args.created_field,
             max_pages=args.max_pages,
+            timeout=args.timeout,
+            retries=args.retries,
         )
         src = f"API (last {args.days} days)"
     else:
@@ -247,6 +318,7 @@ def main():
 
     print(f"Wrote {args.out} and {args.summary}")
     print("DATA_READY_TO_PROCEED")
+
 
 if __name__ == "__main__":
     main()
